@@ -1,0 +1,4 @@
+cryptography>=3.4.8
+pyscard>=2.0.0
+pysatochip>=0.16.0
+pycryptodome>=3.9.0

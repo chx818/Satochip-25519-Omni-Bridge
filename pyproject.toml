@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "satochip-25519-ledger-bridge"
+version = "1.0.0"
+description = "Universal Ed25519 WebHID Virtual Ledger Bridge and Driver for Satochip-25519-J3R452"
+readme = "README.en.md"
+requires-python = ">=3.8"
+license = {text = "LGPL-3.0"}
+authors = [
+    {name = "Satochip-25519 Community"}
+]
+keywords = [
+    "satochip",
+    "ledger",
+    "smartcard",
+    "ed25519",
+    "x25519",
+    "solana",
+    "ton",
+    "sui",
+    "aptos",
+    "polkadot",
+    "near",
+    "webhid",
+    "hardware-wallet"
+]
+dependencies = [
+    "cryptography>=3.4.8",
+    "pyscard>=2.0.0",
+    "pysatochip>=0.16.0",
+    "pycryptodome>=3.9.0"
+]
+
+[project.scripts]
+satochip-25519-cli = "satochip_cli_25519:main"
+satochip-25519-daemon = "virtual_ledger_usbip_daemon:main"

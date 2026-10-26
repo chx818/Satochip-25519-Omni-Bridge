@@ -4,6 +4,7 @@ This implements only the APDU subset listed here; it is not a general Ledger
 protocol emulator. Ledger HID reports are exactly 64 bytes.
 """
 import struct
+from cryptography.hazmat.primitives.asymmetric import ed25519
 from typing import List, Optional
 
 from pysatochip_25519 import SatochipCard, SatochipException, validate_path
@@ -102,7 +103,7 @@ class LedgerSolanaTranslator:
         self.incoming_tx_buffer = bytearray()
         self.signing_path: Optional[List[int]] = None
         self.signing_p1: Optional[int] = None
-        self.signing_path: Optional[List[int]] = None
+        self.signing_pubkey: Optional[bytes] = None
 
     @staticmethod
     def _parse_apdu(apdu: bytes):
@@ -130,6 +131,16 @@ class LedgerSolanaTranslator:
         return path
 
     @staticmethod
+    def _validate_solana_path(path: List[int]) -> None:
+        # This translator is Solana-specific. Hardened-only validation alone
+        # would still allow an Ethereum/TON/etc. path to be signed through the
+        # Solana command namespace and silently derive the wrong account.
+        if len(path) < 2 or (path[0] & 0x7FFFFFFF) != 44:
+            raise ValueError("path is not a BIP44 path")
+        if (path[1] & 0x7FFFFFFF) != 501:
+            raise ValueError("path is not a Solana path")
+
+    @staticmethod
     def _error(sw: bytes) -> bytes:
         return sw
 
@@ -141,11 +152,13 @@ class LedgerSolanaTranslator:
             return SW_WRONG_LENGTH
 
         if cla == CLA_LEDGER_SYSTEM and ins == INS_GET_APP_AND_VERSION:
+            self._clear_signing_state()
             if p1 != 0 or p2 != 0 or data:
                 return SW_WRONG_DATA
             body = bytes([1, len(APP_NAME)]) + APP_NAME + bytes([len(APP_VERSION)]) + APP_VERSION + b"\x00"
             return body + SW_OK
         if cla != CLA_LEDGER_SOLANA:
+            self._clear_signing_state()
             return SW_CLA_NOT_SUPPORTED
 
         if ins == INS_SOLANA_GET_PUBKEY:
@@ -154,6 +167,7 @@ class LedgerSolanaTranslator:
                 return SW_WRONG_DATA
             try:
                 path = self._parse_ledger_path(data)
+                self._validate_solana_path(path)
                 pubkey = self.card.slip10_get_extended_key(path)
                 if len(pubkey) != 32:
                     return SW_CONDITIONS_NOT_SATISFIED
@@ -185,9 +199,13 @@ class LedgerSolanaTranslator:
                     if path_end > len(data):
                         return SW_WRONG_DATA
                     path = self._parse_ledger_path(data[1:path_end])
-                    self.card.slip10_get_extended_key(path)
+                    self._validate_solana_path(path)
+                    signing_pubkey = bytes(self.card.slip10_get_extended_key(path))
+                    if len(signing_pubkey) != 32:
+                        raise ValueError("card returned an invalid Ed25519 public key")
                     self.signing_path = path
                     self.signing_p1 = p1
+                    self.signing_pubkey = signing_pubkey
                     self.incoming_tx_buffer.extend(data[path_end:])
                 else:
                     if self.signing_path is None or self.signing_p1 != p1:
@@ -210,9 +228,16 @@ class LedgerSolanaTranslator:
                     return SW_SECURITY_STATUS
                 message = bytes(self.incoming_tx_buffer)
                 signature = self.card.sign_ed25519_message(message)
-                self._clear_signing_state()
-                if len(signature) != 64:
+                signing_pubkey = self.signing_pubkey
+                if len(signature) != 64 or signing_pubkey is None or len(signing_pubkey) != 32:
+                    self._clear_signing_state()
                     return SW_CONDITIONS_NOT_SATISFIED
+                try:
+                    ed25519.Ed25519PublicKey.from_public_bytes(signing_pubkey).verify(signature, message)
+                except Exception:
+                    self._clear_signing_state()
+                    return SW_CONDITIONS_NOT_SATISFIED
+                self._clear_signing_state()
                 return signature + SW_OK
             except ValueError:
                 self._clear_signing_state()
@@ -233,3 +258,5 @@ class LedgerSolanaTranslator:
         self.incoming_tx_buffer.clear()
         self.signing_path = None
         self.signing_p1 = None
+        self.signing_pubkey = None
+        self.cached_path = []

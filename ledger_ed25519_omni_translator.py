@@ -9,7 +9,7 @@ Universal Ledger APDU Translator for all Ed25519 / SLIP-0010 blockchains:
 
 Translates incoming WebHID Ledger frames from browser wallets (Phantom, Solflare,
 Tonkeeper, Sui Wallet, Petra, Pontem, SubWallet, Polkadot.js, etc.) into
-native Satochip APDUs over PC/SC using NXP J3R452 hardware acceleration.
+native Satochip APDUs over PC/SC using the card's Curve25519/Ed25519 services.
 """
 
 import struct

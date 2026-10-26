@@ -9,7 +9,9 @@ import virtual_ledger_usbip_daemon as daemon
 
 from virtual_ledger_usbip_daemon import (
     VirtualLedgerUSBIPServer, USBIP_CMD_SUBMIT, USBIP_RET_SUBMIT,
-    USB_DT_DEVICE, DESCRIPTOR_DEVICE, STRINGS,
+    USB_DT_DEVICE, USB_DT_CONFIG, USB_DT_HID, USB_DT_REPORT,
+    DESCRIPTOR_DEVICE, DESCRIPTOR_CONFIG, DESCRIPTOR_HID, DESCRIPTOR_REPORT,
+    STRINGS,
 )
 
 
@@ -52,6 +54,37 @@ class USBIPTests(unittest.TestCase):
         server.in_reports_queue.put(b"A" * 64)
         self.assertEqual(server.get_outgoing_report(64), b"A" * 64)
 
+    def test_usb_hid_descriptor_and_standard_state_requests(self):
+        server = self.make_server()
+        self.assertEqual(len(DESCRIPTOR_HID), 9)
+        self.assertEqual(DESCRIPTOR_HID, DESCRIPTOR_CONFIG[18:27])
+
+        hid_setup = struct.pack("<BBHHH", 0x81, 0x06, USB_DT_HID << 8, 0, 255)
+        self.assertEqual(server.handle_control_transfer(hid_setup, 255), DESCRIPTOR_HID)
+        report_setup = struct.pack("<BBHHH", 0x81, 0x06, USB_DT_REPORT << 8, 0, 255)
+        self.assertEqual(server.handle_control_transfer(report_setup, 255), DESCRIPTOR_REPORT)
+
+        get_status = struct.pack("<BBHHH", 0x80, 0x00, 0, 0, 2)
+        self.assertEqual(server.handle_control_transfer(get_status, 2), b"\x00\x00")
+        get_config = struct.pack("<BBHHH", 0x80, 0x08, 0, 0, 1)
+        self.assertEqual(server.handle_control_transfer(get_config, 1), b"\x00")
+        get_interface = struct.pack("<BBHHH", 0x81, 0x0A, 0, 0, 1)
+        self.assertEqual(server.handle_control_transfer(get_interface, 1), b"")
+
+        set_config = struct.pack("<BBHHH", 0x00, 0x09, 1, 0, 0)
+        self.assertEqual(server.handle_control_transfer(set_config, 0), b"")
+        self.assertEqual(server.configuration, 1)
+        self.assertEqual(server.handle_control_transfer(get_config, 1), b"\x01")
+        self.assertEqual(server.handle_control_transfer(get_interface, 1), b"\x00")
+        server._reset_usb_session()
+        self.assertEqual(server.handle_control_transfer(get_config, 1), b"\x00")
+
+    def test_invalid_listener_host_types_are_rejected(self):
+        for host in (None, "", 123, True):
+            with self.subTest(host=host):
+                with self.assertRaises(ValueError):
+                    VirtualLedgerUSBIPServer(host=host, card_pin="test-pin")
+
     def test_ipv6_loopback_is_rejected_by_ipv4_only_listener(self):
         with self.assertRaises(ValueError):
             VirtualLedgerUSBIPServer(host="::1", card_pin="test-pin")
@@ -66,6 +99,25 @@ class USBIPTests(unittest.TestCase):
         with mock.patch.object(daemon.getpass, "getpass", return_value=""):
             with self.assertRaises(SystemExit):
                 daemon.main([])
+
+    def test_shutdown_clears_daemon_credentials_and_card_reference(self):
+        server = self.make_server()
+        fake_card = mock.Mock()
+        fake_card.pin = "test-pin"
+        server.card = fake_card
+        server.init_card = mock.Mock()
+        fake_socket = mock.MagicMock()
+        fake_socket.__enter__.return_value = fake_socket
+        fake_socket.__exit__.return_value = False
+        fake_socket.accept.side_effect = OSError("test shutdown")
+        with mock.patch.object(daemon.socket, "socket", return_value=fake_socket):
+            server.start()
+        fake_card.disconnect.assert_called_once()
+        self.assertIsNone(fake_card.pin)
+        self.assertIsNone(server.card_pin)
+        self.assertIsNone(server.seed)
+        self.assertIsNone(server.translator)
+        self.assertIsNone(server.card)
 
     def test_submit_response_uses_signed_number_of_packets(self):
         server = self.make_server()

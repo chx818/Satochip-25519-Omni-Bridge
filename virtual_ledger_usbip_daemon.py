@@ -81,6 +81,11 @@ DESCRIPTOR_CONFIG = (
     struct.pack("<BBBBHB", 7, USB_DT_ENDPOINT, 0x81, 0x03, 64, 1) +        # EP 0x81 (Interrupt IN)
     struct.pack("<BBBBHB", 7, USB_DT_ENDPOINT, 0x02, 0x03, 64, 1)          # EP 0x02 (Interrupt OUT)
 )
+# The HID descriptor is embedded immediately after the device and interface
+# descriptors in the configuration descriptor. Keep a named copy because
+# Windows HID enumeration commonly requests it separately (GET_DESCRIPTOR,
+# type 0x21), rather than reading it only as part of the full configuration.
+DESCRIPTOR_HID = DESCRIPTOR_CONFIG[18:27]
 
 STRINGS = {
     0: struct.pack("<BBH", 4, USB_DT_STRING, 0x0409), # English
@@ -96,6 +101,8 @@ class VirtualLedgerUSBIPServer:
                  allow_blind_sign: bool = False, default_chain: str = "solana"):
         if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
             raise ValueError("USB/IP port must be an integer in 1..65535")
+        if not isinstance(host, str) or not host:
+            raise ValueError("USB/IP listener host must be a non-empty string")
         self.port = port
         self.host = host
         try:
@@ -128,6 +135,13 @@ class VirtualLedgerUSBIPServer:
         self.import_lock = threading.Lock()
         self.allow_blind_sign = allow_blind_sign
         self.default_chain = default_chain
+        # Minimal USB device state needed by standard enumeration requests.
+        # These values are per imported USB session and are reset whenever the
+        # client attaches/detaches, just like a physical device would be.
+        self.device_address = 0
+        self.configuration = 0
+        self.interface_alt_setting = 0
+        self.hid_protocol = 1  # report protocol; the interface has no boot protocol
 
     def init_card(self):
         print("[+] Connecting to Satochip Card on reader:", self.reader_name)
@@ -163,6 +177,14 @@ class VirtualLedgerUSBIPServer:
             self.running = False
             if self.card is not None:
                 self.card.disconnect()
+                self.card.pin = None
+            # Do not retain the daemon's PIN or optional host-side seed after
+            # the listener has stopped. The virtual device is not reusable
+            # after shutdown and must be recreated with explicit credentials.
+            self.card_pin = None
+            self.seed = None
+            self.translator = None
+            self.card = None
 
     @staticmethod
     def recv_exact(conn: socket.socket, length: int) -> Optional[bytes]:
@@ -358,30 +380,102 @@ class VirtualLedgerUSBIPServer:
         bmRequestType, bRequest, wValue, wIndex, wLength = struct.unpack("<BBHHH", setup)
         limit = min(req_len, wLength)
         request_type = bmRequestType & 0x60
+        recipient = bmRequestType & 0x1F
         request_is_in = bool(bmRequestType & 0x80)
 
-        # Standard device/interface requests used during HID enumeration.
-        if request_type == 0x00 and bRequest in (0x05, 0x09, 0x0B):
-            return b""  # SET_ADDRESS, SET_CONFIGURATION, SET_INTERFACE
-        # HID class requests that do not carry a response payload.
-        if request_type == 0x20 and bRequest in (0x0A, 0x0B):
-            return b""  # SET_IDLE, SET_PROTOCOL
-        if not request_is_in or bRequest != 0x06:  # GET_DESCRIPTOR
-            return b""
+        if request_type == 0x00:
+            # Standard device/interface requests used during HID enumeration.
+            if not request_is_in:
+                if bRequest == 0x05:  # SET_ADDRESS
+                    if (recipient != 0 or wIndex != 0 or wLength != 0
+                            or wValue > 127):
+                        return b""
+                    self.device_address = wValue
+                    return b""
+                if bRequest == 0x09:  # SET_CONFIGURATION
+                    if (recipient != 0 or wIndex != 0 or wLength != 0
+                            or wValue not in (0, 1)):
+                        return b""
+                    self.configuration = wValue
+                    if wValue == 0:
+                        self.interface_alt_setting = 0
+                    return b""
+                if bRequest == 0x0B:  # SET_INTERFACE
+                    if (recipient != 1 or wIndex != 0 or wValue != 0
+                            or wLength != 0 or self.configuration != 1):
+                        return b""
+                    self.interface_alt_setting = 0
+                    return b""
+                return b""
 
-        desc_type = (wValue >> 8) & 0xFF
-        desc_index = wValue & 0xFF
-        if desc_type == USB_DT_DEVICE:
-            value = DESCRIPTOR_DEVICE
-        elif desc_type == USB_DT_CONFIG:
-            value = DESCRIPTOR_CONFIG
-        elif desc_type == USB_DT_STRING:
-            value = STRINGS.get(desc_index, b"")
-        elif desc_type == USB_DT_REPORT:
-            value = DESCRIPTOR_REPORT
-        else:
-            value = b""
-        return value[:limit]
+            if bRequest == 0x00:  # GET_STATUS
+                if (wValue != 0 or wLength != 2
+                        or recipient not in (0, 1, 2)):
+                    return b""
+                # Device, interface, and the two interrupt endpoints have no
+                # feature bits set (no remote wakeup, halt, or self power).
+                return b"\x00\x00"[:limit]
+            if bRequest == 0x08:  # GET_CONFIGURATION
+                if recipient != 0 or wValue != 0 or wIndex != 0 or wLength != 1:
+                    return b""
+                return bytes((self.configuration,))[:limit]
+            if bRequest == 0x0A:  # GET_INTERFACE
+                if (recipient != 1 or wValue != 0 or wIndex != 0
+                        or wLength != 1 or self.configuration != 1):
+                    return b""
+                return bytes((self.interface_alt_setting,))[:limit]
+
+            if bRequest != 0x06:  # GET_DESCRIPTOR
+                return b""
+
+            desc_type = (wValue >> 8) & 0xFF
+            desc_index = wValue & 0xFF
+            if desc_type == USB_DT_DEVICE:
+                if recipient != 0 or wIndex != 0:
+                    return b""
+                value = DESCRIPTOR_DEVICE
+            elif desc_type == USB_DT_CONFIG:
+                if recipient != 0 or wIndex != 0:
+                    return b""
+                value = DESCRIPTOR_CONFIG
+            elif desc_type == USB_DT_STRING:
+                if recipient != 0 or desc_index not in STRINGS:
+                    return b""
+                # A host may request the language-specific string table with
+                # either wIndex=0 or the advertised English LANGID.
+                if wIndex not in (0, 0x0409):
+                    return b""
+                value = STRINGS[desc_index]
+            elif desc_type == USB_DT_HID:
+                if recipient != 1 or desc_index != 0 or wIndex != 0:
+                    return b""
+                value = DESCRIPTOR_HID
+            elif desc_type == USB_DT_REPORT:
+                if recipient != 1 or desc_index != 0 or wIndex != 0:
+                    return b""
+                value = DESCRIPTOR_REPORT
+            else:
+                return b""
+            return value[:limit]
+
+        # HID class requests that do not carry a response payload.
+        if request_type == 0x20 and not request_is_in and bRequest in (0x0A, 0x0B):
+            if recipient != 1 or wIndex != 0 or wLength != 0:
+                return b""
+            if bRequest == 0x0A:  # SET_IDLE: high byte is duration, low is ID
+                if (wValue & 0xFF) != 0:
+                    return b""
+            else:  # SET_PROTOCOL: 0=boot, 1=report; this interface is report-only
+                if wValue not in (0, 1):
+                    return b""
+                self.hid_protocol = wValue
+            return b""
+        if request_type == 0x20 and request_is_in and bRequest in (0x01, 0x02):
+            # GET_REPORT/GET_IDLE are not needed by Ledger clients. Do not
+            # fabricate report contents or expose state for an unimplemented
+            # class request; return an empty data stage instead.
+            return b""
+        return b""
 
     def process_incoming_report(self, report_bytes: bytes):
         apdu = self.framer.feed_packet(report_bytes)
@@ -424,6 +518,10 @@ class VirtualLedgerUSBIPServer:
         if self.translator is not None:
             self.translator._clear_signing_state()
             self.translator.cached_path = []
+        self.device_address = 0
+        self.configuration = 0
+        self.interface_alt_setting = 0
+        self.hid_protocol = 1
 
 
 def main(argv=None):

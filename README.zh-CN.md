@@ -26,7 +26,7 @@
 * **Near Protocol (NEAR)**：BIP44 `397'`（Near Wallet、Meteor）
 
 > [!NOTE]
-> **兼容性说明**：本项目为实验性本地兼容桥，并非 Ledger 官方硬件，亦未获得 Ledger SAS 官方认证。各主流 Web3 钱包通过标准 WebHID 原生接口与虚拟设备交互，实际使用前请针对具体钱包版本、浏览器和网络环境进行测试。
+> **项目与兼容性说明**：本项目属于实验性社区开源项目，是专为 Satochip 智能卡开发的软件兼容桥，并非 Ledger 官方实体硬件。与原版 Satochip 项目相同，密钥派生采用软件 HMAC-SHA512 运算。Web3 钱包通过标准 WebHID 原生接口与虚拟桥交互。由于缺少独立物理屏幕，默认禁用盲签（需显式传入 `--allow-blind-sign` 开启）。
 
 ---
 
@@ -62,14 +62,16 @@ Web 浏览器钱包扩展 (Phantom / Tonkeeper / Sui / Polkadot.js)
 
 ---
 
-## 安全模型与防护边界
+## 核心特性与设计原则
 
-1. **严格绑定 IPv4 回环地址**：守护进程仅监听 `127.0.0.1`，启动前强制校验目标地址，拒绝 IPv6 或非回环地址，彻底杜绝意外暴露至局域网（LAN）的风险。
-2. **Fail-Closed 盲签策略**：由于虚拟桥接器没有物理硬件屏幕进行交易可视化确认，默认关闭盲签。未指定 `--allow-blind-sign` 时，签名请求将被直接拒绝并返回 `SW_SECURITY_STATUS` (`0x6982`)。
-3. **签名释放前本地校验 (Verify-Before-Release)**：卡片生成 Ed25519 签名后，桥接器在释放给上位机前，强制在本地进行数学验签，防止硬件故障注入导致的错误签名泄露。
-4. **多包流状态隔离**：流式续包（`P2_EXTEND`）严格绑定初始包的链路 Profile、派生路径与 P1 参数。任何乱序包或跨链请求均会导致会话中断并清空缓冲区。
-5. **Authentikey 身份强校验**：卡片导出的所有公钥与链码均附带卡内 Authentikey ECDSA 签名，客户端全量验签，阻断中间人篡改。
-6. **敏感内存主动清零**：交易明文缓冲区在签名完成后或遇到任何异常时，显式循环覆写为 0，防止堆内存残留敏感数据。
+1. **严格本机回环隔离**：守护进程严格绑定 `127.0.0.1` 本机地址，启动时主动拒绝外部网络与 IPv6 连接，确保所有 APDU 与 USB/IP 通信仅限本机内部。
+2. **显式盲签控制**：因虚拟桥接器没有物理硬件屏幕进行独立核对，默认关闭盲签。未指定 `--allow-blind-sign` 时，签名请求直接返回 `SW_SECURITY_STATUS` (`0x6982`)。
+3. **客户端强制成对验签 (Pairwise Verification)**：在将 Ed25519 签名交付给 WebHID 之前，转换器与底层 `pysatochip_25519` 驱动均会在宿主端使用暂存的 Edwards 公钥进行本地 RFC 8032 数学验签，杜绝输出未核验签名。
+4. **故障安全会话熔断 (Fail-Safe Session Teardown)**：当发生传输错误、卡片异常或 X25519 弱点拒绝时，宿主端会主动断开 PC/SC 物理会话。这将强制卡片操作系统触发反选（deselect），彻底清空卡内 RAM 暂存的派生私钥，防止遗留孤立会话状态。
+5. **标准 USB HID 状态机响应**：完备实现 USB 标准设备与 HID 类控制传输响应（包括独立 `DESCRIPTOR_HID` 0x21 描述符、`SET_ADDRESS`、`SET_CONFIGURATION`、`GET_STATUS`、`GET_CONFIGURATION`、`GET_INTERFACE`、`SET_INTERFACE`、`SET_IDLE`、`SET_PROTOCOL` 等），确保 Windows 内核 `hidusb.sys` 驱动即插即用、稳定枚举。
+6. **Authentikey 卡片身份强校验**：卡片通过 `0x6B` 导出的所有公钥与链码均附带卡内 Authentikey 签发的 ECDSA 签名，宿主端在反解 Edwards 坐标前全量验签，确认卡片身份真实性。
+7. **流式分包状态一致性**：多包流式传输（`P2_EXTEND`）严格绑定初始请求的公链类型、派生路径与 P1 参数，中间插入其他指令、乱序包或跨链请求均会自动重置清理缓冲区。
+8. **凭证脱敏与内存即时清理**：交易明文数据、PIN 码缓存及会话对象在签名完成、异常终止或服务退出时均会立即重置清零，防止进程内存残留。
 
 ---
 
@@ -138,16 +140,14 @@ stop_virtual_ledger.bat
 仓库内置了完备的离线与实机自动化测试套件：
 
 ```powershell
-# 运行安全边界、USB/IP 协议分包与 Authentikey 防篡改单元测试：
+# 运行协议边界、USB/IP 协议分包与 Authentikey 签名校验测试 (36 项单元测试)：
 python -m unittest -v test_security_boundaries.py test_usbip_protocol.py test_authentikey_response.py
 
 # 运行万能 6 链路由与 RFC 8032 数学验签测试：
 python test_omni_pipeline.py
 
-# 运行单链流水线兼容性测试：
-python test_bridge_pipeline.py
-
-# 运行非破坏性真卡集成测试（需连接卡片）：
+# 运行非破坏性真卡集成测试（需连接卡片，可通过环境变量或交互式输入 PIN）：
+$env:SATOCHIP_TEST_PIN="1234"
 python test_live_card_full.py
 ```
 

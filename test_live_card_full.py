@@ -81,6 +81,13 @@ def run_live_test() -> bool:
         else:
             raise RuntimeError("card accepted an all-zero X25519 peer key")
 
+        # The client deliberately drops the PC/SC session after a card-side
+        # X25519 failure so the staged private key cannot remain usable after
+        # an abnormal command. Re-authenticate before the independent legacy
+        # compatibility check below.
+        print("    Reconnecting after the expected X25519 failure cleanup...")
+        card.connect()
+
         print("[5] Read-only secp256k1 BIP32 compatibility...")
         eth_pub, _ = card.connector.card_bip32_get_extendedkey("m/44'/60'/0'/0/0")
         encoded = eth_pub.get_public_key_bytes(compressed=True)

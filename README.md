@@ -26,7 +26,7 @@ Supported Ed25519 / SLIP-0010 blockchains:
 * **Near Protocol (NEAR)**: BIP44 `397'` (Near Wallet, Meteor)
 
 > [!NOTE]
-> **Compatibility Notice**: This is a local compatibility bridge, not a physical Ledger device and not officially certified by Ledger SAS. Wallets interact through standard WebHID interfaces. Users must test and verify behavior against specific wallet versions, browser updates, and network environments.
+> **Project & Compatibility Notice**: This is an experimental, community-maintained software compatibility bridge for Satochip smart cards, not a physical Ledger device. Like the original Satochip project, key derivation uses software HMAC-SHA512. Wallets communicate with the bridge via standard WebHID interfaces. Blind signing is disabled by default (`--allow-blind-sign` required to enable).
 
 ---
 
@@ -62,14 +62,16 @@ Browser Web3 Wallet (Phantom / Tonkeeper / Sui / Polkadot.js)
 
 ---
 
-## Security Model & Protective Boundaries
+## Key Features & Design Principles
 
-1. **Strict IPv4 Loopback Binding**: The daemon binds strictly to `127.0.0.1`. IPv6 and non-loopback addresses are rejected at initialization to prevent LAN exposure.
-2. **Fail-Closed Blind Signing**: Because virtual bridges lack a dedicated trusted display screen, `--allow-blind-sign` is disabled by default. When disabled, unverified signing requests are rejected with `SW_SECURITY_STATUS` (`0x6982`).
-3. **Verify-Before-Release Guard**: The bridge mathematically verifies on-card Ed25519 signatures locally against the staged public key before releasing them to WebHID.
-4. **Continuation Stream Isolation**: Multi-packet signing streams (`P2_EXTEND`) are bound to the specific chain, derivation path, and P1 parameter of the initial packet. Any out-of-order or cross-chain packets immediately abort the session and zero out the buffer.
-5. **Authentikey Identity Binding**: Every derived public key and chaincode exported by the card is cryptographically certified by an on-card Authentikey signature, validated by `pysatochip_25519.py` to defeat man-in-the-middle tampering.
-6. **Zero Memory Residue**: Sensitive transaction payload buffers are explicitly zeroed out in memory immediately after signing or upon any error condition.
+1. **Local Loopback Isolation**: The daemon binds strictly to `127.0.0.1`. Remote and non-loopback network connections are rejected at initialization to ensure all APDU and USB/IP communication remains on the local machine.
+2. **Explicit Blind Signing Control**: Because virtual bridges lack a dedicated hardware display screen, blind signing is disabled by default. When disabled, unverified signing requests return `SW_SECURITY_STATUS` (`0x6982`).
+3. **Client-Side Pairwise Verification**: Before any Ed25519 signature is released to WebHID clients, both the translator and the underlying `pysatochip_25519` driver verify the 64-byte signature mathematically against the staged Edwards public key via RFC 8032.
+4. **Fail-Safe Session Teardown**: If a card error, transport fault, or invalid low-order X25519 peer key occurs, the PC/SC session is immediately terminated. This forces the card OS to deselect the applet, wiping transient RAM private keys and preventing stale staged keys from lingering.
+5. **Standard USB HID State Machine**: Implements complete USB device and HID control transfer handling (`SET_ADDRESS`, `SET_CONFIGURATION`, `GET_STATUS`, `GET_CONFIGURATION`, `GET_INTERFACE`, `SET_INTERFACE`, `SET_IDLE`, `SET_PROTOCOL`, and a dedicated `DESCRIPTOR_HID` 0x21). This ensures reliable, driverless plug-and-play enumeration on Windows via `hidusb.sys`.
+6. **Authentikey Public Key Verification**: Public keys and chaincodes exported via `0x6B` are cryptographically certified by the card's internal Authentikey ECDSA signature, verified by the host driver to confirm card identity.
+7. **Multi-Packet Stream Consistency**: Multi-packet APDU streams (`P2_EXTEND`) are strictly bound to the initial chain profile, derivation path, and P1 parameter. Any intervening command, out-of-order chunk, or cross-chain request resets the signing buffer.
+8. **Credential & Buffer Hygiene**: Sensitive transaction payloads, card PINs, and session references are scrubbed from memory immediately upon signature completion, error abort, or daemon shutdown.
 
 ---
 
@@ -123,7 +125,7 @@ start_virtual_ledger.bat
 1. Enter your card PIN in the dedicated daemon prompt (cached only in host session memory).
 2. The launcher automatically probes `127.0.0.1:3240` until the card SecureChannel is established, then executes `usbip attach`.
 3. Open Windows **Device Manager** $\to$ **Human Interface Devices** to confirm `Ledger Nano S` is mounted!
-4. Launch Chrome, open **Phantom**, **Tonkeeper**, or **Sui Wallet**, select **"Connect Hardware Wallet $\to$ Ledger"**, and approve transactions natively.
+4. Launch a supported wallet and select its Ledger/WebHID integration. This bridge has no trusted display, so transaction approval is not visually verified by the card; blind signing remains disabled unless you explicitly opt in with `--allow-blind-sign`.
 
 To stop the bridge and detach virtual devices:
 
@@ -135,19 +137,18 @@ stop_virtual_ledger.bat
 
 ## Test Suite & Verification
 
-The repository contains an exhaustive offline and live hardware test suite:
+The repository includes comprehensive offline protocol tests and non-destructive smart card integration checks:
 
 ```powershell
-# Run security boundaries, USB/IP framing, and Authentikey anti-tamper unit tests:
+# Run protocol boundary, USB/IP framing, and Authentikey verification tests (36 unit tests):
 python -m unittest -v test_security_boundaries.py test_usbip_protocol.py test_authentikey_response.py
 
 # Run universal 6-chain translation & RFC 8032 math verification:
 python test_omni_pipeline.py
 
-# Run legacy single-chain pipeline verification:
-python test_bridge_pipeline.py
-
-# Run non-destructive live card integration test (requires card in reader):
+# Run non-destructive live smart card integration test (requires card in reader):
+# Set your PIN via environment variable or enter it at the hidden prompt:
+$env:SATOCHIP_TEST_PIN="1234"
 python test_live_card_full.py
 ```
 

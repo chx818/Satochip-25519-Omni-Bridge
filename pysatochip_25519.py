@@ -34,6 +34,8 @@ SW_ED25519_UNINITIALIZED = 0x9C4E
 SW_X25519_FAILURE = 0x9C4F
 MAX_PATH_DEPTH = 10
 MAX_SIGN_MESSAGE = 149  # SecureChannel.unwrap documents a 154-byte plaintext APDU limit.
+MIN_SLIP10_SEED_LENGTH = 16
+MAX_SLIP10_SEED_LENGTH = 64
 ED25519_PUBLIC_PROOF_TAG = b"Satochip Ed25519 public key v1"
 HMAC_FLAG_2FA = b"\x80\x00"
 HMAC_PAD_ED25519 = b"\xce" * 32
@@ -44,16 +46,18 @@ FIELD_P = (1 << 255) - 19
 def parse_bip32_path(path_str: str) -> List[int]:
     """Parse a canonical, hardened SLIP-0010 path.
 
-    Ed25519 SLIP-0010 has no public/non-hardened derivation.  The old parser
-    silently skipped empty components and accepted paths without the ``m/``
-    root, which made malformed user input look like a different valid path.
-    Keep the textual parser strict and leave the integer-list validator as the
-    single validation point for callers that already have decoded indices.
+    Ed25519 SLIP-0010 has no public/non-hardened derivation. The textual parser
+    requires an exact ``m`` root and rejects malformed/empty components.
     """
-    if not isinstance(path_str, str) or not path_str.startswith("m/"):
-        raise ValueError("path must start with the exact root prefix 'm/'")
+    if not isinstance(path_str, str) or (
+        path_str != "m" and not path_str.startswith("m/")
+    ):
+        raise ValueError("path must start with the exact root prefix 'm'")
     if path_str != path_str.strip():
         raise ValueError("path must not contain outer whitespace")
+    if path_str == "m":
+        validate_path([])
+        return []
     elements = path_str[2:].split('/')
     if not elements or any(not elem for elem in elements):
         raise ValueError("path contains an empty component")
@@ -70,8 +74,8 @@ def parse_bip32_path(path_str: str) -> List[int]:
 
 
 def validate_path(path: List[int]) -> None:
-    if not 1 <= len(path) <= MAX_PATH_DEPTH:
-        raise ValueError(f"Path depth must be 1..{MAX_PATH_DEPTH}")
+    if not 0 <= len(path) <= MAX_PATH_DEPTH:
+        raise ValueError(f"Path depth must be 0..{MAX_PATH_DEPTH}")
     for index in path:
         if (isinstance(index, bool) or not isinstance(index, int)
                 or not 0x80000000 <= index <= 0xFFFFFFFF):
@@ -134,9 +138,21 @@ class SatochipException(Exception):
 class SatochipCard:
     """Satochip host client. It never silently creates or resets card state."""
     def __init__(self, reader_name: Optional[str] = None, pin: Optional[str] = None, seed: Optional[bytes] = None):
+        if reader_name is not None and not isinstance(reader_name, str):
+            raise ValueError("reader_name must be a string")
+        if seed is not None:
+            try:
+                seed = memoryview(seed).tobytes()
+            except Exception as exc:
+                raise ValueError("seed must be bytes-like") from exc
+            if not MIN_SLIP10_SEED_LENGTH <= len(seed) <= MAX_SLIP10_SEED_LENGTH:
+                raise ValueError(
+                    f"SLIP-0010 seed must be {MIN_SLIP10_SEED_LENGTH}.."
+                    f"{MAX_SLIP10_SEED_LENGTH} bytes"
+                )
         self.reader_name = reader_name
         self.pin = pin
-        self.seed = bytes(seed) if seed is not None else None
+        self.seed = seed
         self.connection = None
         self.connector: Optional[CardConnector] = None
         self.pin_verified = False
@@ -144,6 +160,7 @@ class SatochipCard:
         self.is_seeded = False
         self.setup_done = False
         self.authentikey = None
+        self.staged_public_key: Optional[bytes] = None
 
     def connect(self):
         """Connect to an already initialized card and establish a fresh secure channel.
@@ -207,6 +224,10 @@ class SatochipCard:
                 except Exception:
                     pass
             cc.cardservice = CardServiceWrapper(self.connection)
+            # CardConnector normally sets this while acquiring a CardRequest.
+            # We deliberately use a caller-selected PC/SC connection instead,
+            # so synchronize the flag before card_select/card_transmit.
+            cc.card_present = True
             self.connector = cc
             self.authentikey = None
 
@@ -252,7 +273,18 @@ class SatochipCard:
         2FA policy to a different card, so every disconnect returns the object
         to a neutral state.
         """
-        if self.connection:
+        connector = self.connector
+        if connector is not None:
+            # CardConnector caches the PIN after card_verify_PIN(). Clear that
+            # host-side copy before dropping the connector object.
+            try:
+                connector.pin = None
+                connector.pin_nbr = None
+                connector.sc = None
+                connector.card_present = False
+            except Exception:
+                pass
+        if self.connection is not None:
             try:
                 self.connection.disconnect()
             except Exception:
@@ -264,6 +296,7 @@ class SatochipCard:
         self.is_seeded = False
         self.setup_done = False
         self.authentikey = None
+        self.staged_public_key = None
 
     def _ensure_connected(self):
         if self.connector is None or self.connection is None:
@@ -307,24 +340,74 @@ class SatochipCard:
             key, chain = digest[:32], digest[32:]
         return _public_bytes(ed25519.Ed25519PrivateKey.from_private_bytes(key).public_key())
 
+    def _sign_ed25519_message_unbound(
+        self, message: bytes, twofa_response: Optional[bytes] = None
+    ) -> bytes:
+        """Sign only the internal P2=02 public-key proof.
+
+        P2=02 intentionally stages a private key before its Edwards public key
+        has been recovered.  Keep that exception private to the derivation
+        flow; callers must use the pairwise-bound public method below.
+        """
+        return self._sign_ed25519_message(message, twofa_response, require_staged=False)
+
     def sign_ed25519_message(self, message: bytes, twofa_response: Optional[bytes] = None) -> bytes:
-        message = bytes(message)
+        """Sign a message only after the staged Ed25519 key is pairwise bound."""
+        if self.staged_public_key is None:
+            raise SatochipException(
+                "No pairwise-verified Ed25519 key is staged",
+                SW_ED25519_UNINITIALIZED,
+            )
+        return self._sign_ed25519_message(message, twofa_response, require_staged=True)
+
+    def _sign_ed25519_message(
+        self,
+        message: bytes,
+        twofa_response: Optional[bytes],
+        require_staged: bool,
+    ) -> bytes:
+        try:
+            message = memoryview(message).tobytes()
+        except TypeError as exc:
+            raise ValueError("Message must be bytes-like") from exc
         if not 1 <= len(message) <= MAX_SIGN_MESSAGE:
             raise ValueError(f"Message must be 1..{MAX_SIGN_MESSAGE} bytes")
-        payload = message
         self._ensure_connected()
-        needs_2fa = bool(self.needs_2fa or getattr(self.connector, 'needs_2FA', False))
-        if needs_2fa:
-            if len(message) > MAX_SIGN_MESSAGE - 22:
-                raise ValueError("2FA-protected signing allows at most 127 message bytes")
-            digest = hashlib.sha256(message).digest()
-            payload += self._twofa_payload(digest, HMAC_PAD_ED25519, twofa_response)[32:]
-        elif twofa_response is not None:
-            raise ValueError("A 2FA response was supplied but the card does not require 2FA")
-        response = self._transmit(INS_SIGN_ED25519_MESSAGE, 0xFF, 0x00, payload)
-        if len(response) != 64:
-            raise SatochipException(f"Unexpected Ed25519 signature length: {len(response)}")
-        return response
+        command_started = False
+        try:
+            payload = message
+            needs_2fa = bool(self.needs_2fa or getattr(self.connector, 'needs_2FA', False))
+            if needs_2fa:
+                if len(message) > MAX_SIGN_MESSAGE - 22:
+                    raise ValueError("2FA-protected signing allows at most 127 message bytes")
+                digest = hashlib.sha256(message).digest()
+                payload += self._twofa_payload(digest, HMAC_PAD_ED25519, twofa_response)[32:]
+            elif twofa_response is not None:
+                raise ValueError("A 2FA response was supplied but the card does not require 2FA")
+            command_started = True
+            response = self._transmit(INS_SIGN_ED25519_MESSAGE, 0xFF, 0x00, payload)
+            if len(response) != 64:
+                raise SatochipException(f"Unexpected Ed25519 signature length: {len(response)}")
+            if require_staged:
+                if self.staged_public_key is None or len(self.staged_public_key) != 32:
+                    raise SatochipException("Pairwise public key state is malformed")
+                try:
+                    ed25519.Ed25519PublicKey.from_public_bytes(self.staged_public_key).verify(
+                        response, message
+                    )
+                except Exception as verify_error:
+                    raise SatochipException(
+                        "Card returned an Ed25519 signature that fails pairwise verification"
+                    ) from verify_error
+            return response
+        except Exception as exc:
+            if command_started:
+                # Do not leave a staged private key usable after a card/native
+                # fault, transport error, or invalid signature response.
+                self.disconnect()
+            if isinstance(exc, SatochipException):
+                raise
+            raise
 
     def _verify_authentikey_signed_response(self, response: bytes, signed_length: int) -> None:
         """Verify [signed_data | sig_len | DER ECDSA signature] from the applet.
@@ -335,7 +418,8 @@ class SatochipCard:
         derived data without detection.
         """
         response = bytes(response)
-        if signed_length < 0 or len(response) < signed_length + 2:
+        if (isinstance(signed_length, bool) or not isinstance(signed_length, int)
+                or signed_length < 0 or len(response) < signed_length + 2):
             raise SatochipException("Malformed Authentikey-signed response")
         sig_length = int.from_bytes(response[signed_length:signed_length + 2], "big")
         sig_start = signed_length + 2
@@ -360,43 +444,75 @@ class SatochipCard:
         path_list = parse_bip32_path(path) if isinstance(path, str) else list(path)
         path_bytes = slip10_path_bytes(path_list)
         self._ensure_connected()
+        operation_started = False
+        try:
+            # P2=02 returns the Montgomery u-coordinate derived from the same SLIP-0010 child.
+            # The applet clears its pairwise public key for this intermediate
+            # operation; mirror that state before the proof signature below.
+            self.staged_public_key = None
+            operation_started = True
+            response = self._transmit(INS_SLIP10_GET_EXTENDED_KEY, len(path_list), 0x02, path_bytes)
+            if len(response) < 66 or response[32:34] != b"\x00\x20":
+                raise SatochipException("Malformed X25519 public-key response")
+            self._verify_authentikey_signed_response(response, 66)
+            public_u = response[34:66]
+            proof_message = ED25519_PUBLIC_PROOF_TAG + path_bytes + public_u
+            proof_signature = self._sign_ed25519_message_unbound(proof_message, twofa_response)
+            pubkey = recover_ed25519_public_key(public_u, proof_message, proof_signature)
 
-        # P2=02 returns the Montgomery u-coordinate derived from the same SLIP-0010 child.
-        response = self._transmit(INS_SLIP10_GET_EXTENDED_KEY, len(path_list), 0x02, path_bytes)
-        if len(response) < 66 or response[32:34] != b"\x00\x20":
-            raise SatochipException("Malformed X25519 public-key response")
-        self._verify_authentikey_signed_response(response, 66)
-        public_u = response[34:66]
-        proof_message = ED25519_PUBLIC_PROOF_TAG + path_bytes + public_u
-        proof_signature = self.sign_ed25519_message(proof_message, twofa_response)
-        pubkey = recover_ed25519_public_key(public_u, proof_message, proof_signature)
+            if self.seed is not None:
+                expected = self.derive_slip10_pubkey(path_list)
+                if not hmac.compare_digest(pubkey, expected):
+                    raise SatochipException("Card-derived Ed25519 key does not match the supplied seed")
 
-        if self.seed is not None:
-            expected = self.derive_slip10_pubkey(path_list)
-            if not hmac.compare_digest(pubkey, expected):
-                raise SatochipException("Card-derived Ed25519 key does not match the supplied seed")
-
-        # Re-stage with the recovered Ed key so every later signature receives pairwise verify.
-        path_and_pubkey = path_bytes + pubkey
-        response = self._transmit(INS_SLIP10_GET_EXTENDED_KEY, len(path_list), 0x01, path_and_pubkey)
-        if len(response) < 66 or response[32:34] != b"\x00\x20" or response[34:66] != pubkey:
-            raise SatochipException("Malformed Ed25519 key-staging response")
-        self._verify_authentikey_signed_response(response, 66)
-        return pubkey
+            # Re-stage with the recovered Ed key so every later signature receives pairwise verify.
+            path_and_pubkey = path_bytes + pubkey
+            operation_started = True
+            response = self._transmit(INS_SLIP10_GET_EXTENDED_KEY, len(path_list), 0x01, path_and_pubkey)
+            if len(response) < 66 or response[32:34] != b"\x00\x20" or response[34:66] != pubkey:
+                raise SatochipException("Malformed Ed25519 key-staging response")
+            self._verify_authentikey_signed_response(response, 66)
+            self.staged_public_key = bytes(pubkey)
+            return pubkey
+        except Exception:
+            # P2=02 stages a private key before the host has authenticated the
+            # Ed25519 public key. A failed proof, seed check, or P2=01 restage
+            # must terminate the PC/SC session so the applet's deselect cleanup
+            # removes that unbound key before any later signing call.
+            if operation_started:
+                self.disconnect()
+            raise
 
     def x25519_key_agreement(self, remote_public_key: bytes,
                              twofa_response: Optional[bytes] = None) -> bytes:
         """Use the currently staged SLIP-0010 key for X25519 key agreement."""
-        remote_public_key = bytes(remote_public_key)
+        if self.staged_public_key is None:
+            raise SatochipException(
+                "No pairwise-verified Ed25519 key is staged",
+                SW_ED25519_UNINITIALIZED,
+            )
+        if len(self.staged_public_key) != 32:
+            raise SatochipException("Pairwise public key state is malformed")
+        try:
+            remote_public_key = memoryview(remote_public_key).tobytes()
+        except TypeError as exc:
+            raise ValueError("Remote X25519 public key must be bytes-like") from exc
         if len(remote_public_key) != 32:
             raise ValueError("Remote X25519 public key must be exactly 32 bytes")
         self._ensure_connected()
-        payload = remote_public_key
-        if self.needs_2fa or getattr(self.connector, 'needs_2FA', False):
-            payload = self._twofa_payload(remote_public_key, HMAC_PAD_X25519, twofa_response)
-        elif twofa_response is not None:
-            raise ValueError("A 2FA response was supplied but the card does not require 2FA")
-        result = self._transmit(INS_X25519_KEY_AGREEMENT, 0xFF, 0x00, payload)
-        if len(result) != 32 or not any(result):
-            raise SatochipException("Invalid X25519 shared-secret response", SW_X25519_FAILURE)
-        return result
+        command_started = False
+        try:
+            payload = remote_public_key
+            if self.needs_2fa or getattr(self.connector, 'needs_2FA', False):
+                payload = self._twofa_payload(remote_public_key, HMAC_PAD_X25519, twofa_response)
+            elif twofa_response is not None:
+                raise ValueError("A 2FA response was supplied but the card does not require 2FA")
+            command_started = True
+            result = self._transmit(INS_X25519_KEY_AGREEMENT, 0xFF, 0x00, payload)
+            if len(result) != 32 or not any(result):
+                raise SatochipException("Invalid X25519 shared-secret response", SW_X25519_FAILURE)
+            return result
+        except Exception:
+            if command_started:
+                self.disconnect()
+            raise

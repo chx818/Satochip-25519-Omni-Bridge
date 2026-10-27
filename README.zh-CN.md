@@ -13,6 +13,13 @@
 
 ---
 
+> [!TIP]
+> **支持开源开发 / 购买预装全功能成品硬件卡**：  
+> 如果您来自中国或者拥有中国电商网站可用的支付方式，可以考虑直接购买我的物美价廉的全功能成品卡片来支持我。基于 **NXP J3R452** 构建，集成 **FIDO2 + PIV + OpenPGP + OTP + Satochip + Seedkeeper**，售价仅需 **119 元（约 18 美元）**。  
+> 🛒 **购买链接**：[淘宝商品直达 (item.taobao.com)](https://item.taobao.com/item.htm?ft=t&id=1087207954892)
+
+---
+
 ## 项目概述
 
 **`Satochip-25519-Omni-Bridge`** 是一套实验性、本机回环的 WebHID 兼容层。它通过 Windows USB/IP 协议在操作系统内核级模拟出一台免驱的标准 **Ledger Nano S** 硬件钱包（`VID: 0x2C97, PID: 0x0001`, UsagePage: `0xFFA0`），将主流 Web3 钱包发出的 WebHID 请求无缝转换为运行 [`Satochip-25519-Applet`](https://github.com/chx818/Satochip-25519-Applet) 的安全智能卡原生 APDU 命令。

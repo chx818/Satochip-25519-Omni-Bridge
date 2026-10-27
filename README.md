@@ -13,6 +13,13 @@
 
 ---
 
+> [!TIP]
+> **Support this Project / Purchase Pre-Flushed Hardware Cards**:  
+> If you are based in China or have access to payment methods supported on Chinese e-commerce platforms, consider purchasing our affordable, ready-to-use, all-in-one smart card to support development! Built on **NXP J3R452**, it integrates **FIDO2 + PIV + OpenPGP + OTP + Satochip + Seedkeeper**, priced at only **¥119 (~$18 USD)**.  
+> 🛒 **Order Link**: [Taobao (item.taobao.com)](https://item.taobao.com/item.htm?ft=t&id=1087207954892)
+
+---
+
 ## Overview
 
 **`Satochip-25519-Omni-Bridge`** is an experimental, local-loopback compatibility suite. It emulates a standard **Ledger Nano S** (`VID: 0x2C97, PID: 0x0001`, UsagePage: `0xFFA0`) at the Windows kernel level via USB/IP, transparently converting WebHID requests from major Web3 wallets into native APDU commands for smart cards running [**`Satochip-25519-Applet`**](https://github.com/chx818/Satochip-25519-Applet).
